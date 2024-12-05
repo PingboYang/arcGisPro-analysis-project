@@ -2,7 +2,10 @@ import arcpy
 import os
 import logging
 import datetime
+import psycopg2
 import json
+
+
 
 print(arcpy.GetInstallInfo())
 #only test the xy table
@@ -238,6 +241,62 @@ def export_to_geojson(input_features, output_geojson):
     logging.info(f"GeoJSON created: {output_geojson}")
 
 
+def upload_geojson_to_db(geojson_data, db_params):
+    """
+    Upload GeoJSON data directly to a PostgreSQL database with a dynamic table name.
+    Args:
+        geojson_data (dict): GeoJSON data as a dictionary.
+        db_params (dict): Dictionary containing database connection parameters.
+    """
+    try:
+        # Generate a unique table name based on the current date and time
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        table_name = f"geojson_data_{timestamp}"
+        
+        # Connect to the PostgreSQL database
+        conn = psycopg2.connect(
+            dbname=db_params['dbname'],
+            user=db_params['user'],
+            password=db_params['password'],
+            host=db_params['host'],
+            port=db_params['port']
+        )
+        cur = conn.cursor()
+        logging.info(f"Connected to the database: {db_params['dbname']}")
+
+        # Create a new table for the GeoJSON data
+        logging.info(f"Creating table '{table_name}'...")
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS {table_name} (
+                id SERIAL PRIMARY KEY,
+                properties JSONB,
+                geometry GEOMETRY(geometry, 4326)
+            );
+        """)
+        conn.commit()
+        logging.info(f"Table '{table_name}' created successfully.")
+
+        # Insert GeoJSON features into the table
+        logging.info("Inserting GeoJSON data into the table...")
+        for feature in geojson_data['features']:
+            properties = feature.get('properties', {})
+            geometry = json.dumps(feature.get('geometry'))
+            cur.execute(f"""
+                INSERT INTO {table_name} (properties, geometry)
+                VALUES (%s, ST_GeomFromGeoJSON(%s));
+            """, (json.dumps(properties), geometry))
+
+        conn.commit()
+        logging.info(f"GeoJSON data successfully uploaded to table '{table_name}'.")
+        return table_name  # Return the table name for reference
+    except Exception as e:
+        logging.error(f"Error uploading GeoJSON to the database: {e}")
+        raise
+    finally:
+        cur.close()
+        conn.close()    
+
+
 
 # Main workflow
 if __name__ == "__main__":
@@ -276,11 +335,23 @@ if __name__ == "__main__":
 
 
         # Export to GeoJSON
-        timestamp=datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        geojson_output = f"C:\\Users\\cisuser\\Documents\\research\\mapProject\\output_{timestamp}.json"
-        export_to_geojson(joined_features, geojson_output)
+        temp_geojson = f"C:\\Users\\cisuser\\Documents\\research\\temp_output.geojson"
+        export_to_geojson(joined_features, temp_geojson)
+
+        with open(temp_geojson, "r") as geojson_file:
+            geojson_data=json.load(geojson_file)
+
+        # Upload GeoJSON data to the database
+        db_params = {
+            "dbname": "mygisdb",
+            "user": "postgres",
+            "password": "bmcccis##",
+            "host": "postgres-1.ctfojr4mfu0j.us-east-1.rds.amazonaws.com",
+            "port": "5432"
+        }
+        table_name = upload_geojson_to_db(geojson_data, db_params)
+        logging.info(f"GeoJSON uploaded to table '{table_name}' successfully.")    
 
         logging.info("Workflow completed successfully!")
     except Exception as e:
         logging.error(f"An error occurred: {e}")
-
