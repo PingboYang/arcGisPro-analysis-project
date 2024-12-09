@@ -72,7 +72,7 @@ fields_to_keep = [
     "Street", "FeatureTyp", "TrafDir", "StreetCode", "LZip", "LBoro", 
     "RW_TYPE", "Status", "StreetWidth_Min", "BikeLane", "BIKE_TRAFDIR", 
     "POSTED_SPEED", "SHAPE_Length", "StreetWidth_Max", "LCB2020", 
-    "Snow_Priority","gridcode","OBJECTID","Shape","SHAPE"
+    "Snow_Priority","gridcode","OBJECTID","Shape","SHAPE","gridcode_1"
 ]
 
 # Ensure the output geodatabase exists
@@ -114,7 +114,7 @@ def kernel_density(input_points, output_density):
         kernel_raster = arcpy.sa.KernelDensity(
             in_features=input_points,
             population_field="EPDO",
-            cell_size=10,
+            cell_size=5,
             search_radius=100,
             out_cell_values="DENSITIES",
             method="PLANAR",
@@ -148,6 +148,12 @@ def reclassify_density(input_raster, output_reclass, min_value, max_value):
 
         arcpy.sa.Reclassify(input_raster, "Value", remap, "NODATA").save(output_reclass)
         logging.info(f"Reclassification completed: {output_reclass}")
+
+        # Check if the reclassified raster has gridcode values
+        unique_values = arcpy.sa.ZonalStatisticsAsTable(
+            output_reclass, "Value", input_raster, "in_memory/zone_stats", "NODATA", "ALL"
+        )
+        logging.info(f"Unique gridcode values in reclassified raster: {[row[0] for row in arcpy.da.SearchCursor(unique_values, ['Value'])]}")
     except Exception as e:
         logging.error(f"Error in reclassify_density: {e}")
         raise
@@ -163,69 +169,152 @@ def raster_to_polygon(input_raster, output_polygon):
             raster_field="VALUE",
         )
         logging.info(f"Polygon created: {output_polygon}")
+
+        # Check gridcode values in the polygon feature class
+        gridcode_values = [row[0] for row in arcpy.da.SearchCursor(output_polygon, ["gridcode"])]
+        logging.info(f"Gridcode values in polygons: {gridcode_values}")
     except Exception as e:
         logging.error(f"Error in raster_to_polygon: {e}")
         raise
 
 
-def polygon_to_line(input_polygon, output_line):
+def polygon_to_line(input_polygon, output_line, reprojected_line):
     try:
         logging.info("Step 5: Converting polygons to lines...")
-        arcpy.management.PolygonToLine(
-            in_features=input_polygon,
-            out_feature_class=output_line,
-            neighbor_option="IGNORE_NEIGHBORS",
-        )
+        arcpy.management.PolygonToLine(input_polygon, output_line, "IGNORE_NEIGHBORS")
         logging.info(f"Lines created: {output_line}")
+
+        # Reproject lines only if necessary
+        lion_spatial_ref = arcpy.Describe(os.path.join(LION_GDB, "LION")).spatialReference
+        if arcpy.Describe(output_line).spatialReference.name != lion_spatial_ref.name:
+            arcpy.management.Project(output_line, reprojected_line, lion_spatial_ref)
+            logging.info(f"Lines reprojected to: {lion_spatial_ref.name}")
+            return reprojected_line
+
+        return output_line
     except Exception as e:
         logging.error(f"Error in polygon_to_line: {e}")
         raise
 
 
+
 def spatial_join(target_features, join_features, output_fc):
-    """
-    Perform spatial join between target_features and join_features.
-    """
     try:
         logging.info("Step 6: Performing spatial join...")
 
-        # Log fields in the target and join features
-        target_fields = [field.name for field in arcpy.ListFields(target_features)]
-        join_fields = [field.name for field in arcpy.ListFields(join_features)]
-        logging.info(f"Fields in target_features ({target_features}): {target_fields}")
-        logging.info(f"Fields in join_features ({join_features}): {join_fields}")
+        # Configure field mappings
+        field_mappings = arcpy.FieldMappings()
+        field_mappings.addTable(target_features)
+        field_mappings.addTable(join_features)
+
+        # Explicitly map `gridcode`
+        gridcode_map = arcpy.FieldMap()
+        gridcode_map.addInputField(join_features, "gridcode")
+        gridcode_field = gridcode_map.outputField
+        gridcode_field.name = "gridcode"
+        gridcode_map.outputField = gridcode_field
+        field_mappings.addFieldMap(gridcode_map)
 
         # Perform the spatial join
         arcpy.analysis.SpatialJoin(
-            target_features=target_features,
-            join_features=join_features,
+            target_features,
+            join_features,
             out_feature_class=output_fc,
             join_type="KEEP_ALL",
+            field_mapping=field_mappings,
         )
         logging.info(f"Spatial join completed: {output_fc}")
 
-        # Log the record count
-        count = int(arcpy.management.GetCount(output_fc)[0])
-        logging.info(f"Spatial join output contains {count} features.")
-        if count == 0:
-            raise ValueError("Spatial join resulted in zero features. Check input data alignment.")
-
-        # Log fields in the output feature class
-        output_fields = [field.name for field in arcpy.ListFields(output_fc)]
-        logging.info(f"Fields in output feature class ({output_fc}): {output_fields}")
-
-        # Delete unwanted fields
-        if fields_to_keep:
-            fields_to_delete = [f for f in output_fields if f not in fields_to_keep + ["OBJECTID", "Shape"]]
-            if fields_to_delete:
-                arcpy.management.DeleteField(output_fc, fields_to_delete)
-                logging.info(f"Deleted fields: {fields_to_delete}")
-            else:
-                logging.info("No fields deleted. All required fields are present.")
-
+        # Log unique gridcode values in output
+        check_gridcode_values(output_fc, "gridcode")
     except Exception as e:
         logging.error(f"Error in spatial_join: {e}")
         raise
+
+
+def second_spatial_join(joined_features, lines, final_output_fc):
+    """
+    Perform a second spatial join between the already joined features and the lines.
+    """
+    try:
+        logging.info("Step 7: Performing second spatial join...")
+
+        # Check spatial references and reproject if needed
+        target_sr = arcpy.Describe(joined_features).spatialReference
+        join_sr = arcpy.Describe(lines).spatialReference
+
+        if target_sr.name != join_sr.name:
+            logging.info("Reprojecting lines to match the joined_features spatial reference...")
+            reprojected_lines = os.path.join(OUTPUT_GDB, "reprojected_lines")
+            arcpy.management.Project(lines, reprojected_lines, target_sr)
+            lines = reprojected_lines
+            logging.info(f"Reprojected lines saved to: {lines}")
+
+        # Perform the spatial join
+        arcpy.analysis.SpatialJoin(
+            target_features=joined_features,
+            join_features=lines,
+            out_feature_class=final_output_fc,
+            join_type="KEEP_ALL",
+        )
+        logging.info(f"Second spatial join completed: {final_output_fc}")
+
+        # Log the record count and fields in the final output
+        count = int(arcpy.management.GetCount(final_output_fc)[0])
+        logging.info(f"Second spatial join output contains {count} features.")
+        if count == 0:
+            raise ValueError("Second spatial join resulted in zero features. Check input data alignment.")
+
+        output_fields = [field.name for field in arcpy.ListFields(final_output_fc)]
+        logging.info(f"Fields in final output feature class ({final_output_fc}): {output_fields}")
+
+        # Log gridcode values in the final output
+        with arcpy.da.SearchCursor(final_output_fc, ["gridcode"]) as cursor:
+            gridcode_values = {row[0] for row in cursor}
+        logging.info(f"Gridcode values in final output: {gridcode_values}")
+
+    except Exception as e:
+        logging.error(f"Error in second_spatial_join: {e}")
+        raise
+
+
+def configure_field_mapping(target, join, output_fc):
+    """
+    Configures field mappings to ensure 'gridcode' is transferred.
+    """
+    field_mappings = arcpy.FieldMappings()
+
+    # Add target fields
+    target_fm = arcpy.FieldMap()
+    target_fm.addInputField(target, "gridcode")
+    target_fm.mergeRule = "First"
+    field_mappings.addFieldMap(target_fm)
+
+    # Add join fields
+    join_fm = arcpy.FieldMap()
+    join_fm.addInputField(join, "gridcode")
+    join_fm.mergeRule = "First"
+    field_mappings.addFieldMap(join_fm)
+
+    # Perform the spatial join
+    arcpy.analysis.SpatialJoin(target, join, output_fc, "KEEP_ALL", "", field_mappings)
+    logging.info(f"Field mapping configured and spatial join completed: {output_fc}")
+
+
+def check_gridcode_values(feature_class, field_name):
+    """
+    Logs unique values in the specified field of a feature class.
+    """
+    try:
+        with arcpy.da.SearchCursor(feature_class, [field_name]) as cursor:
+            values = {row[0] for row in cursor if row[0] is not None}
+        logging.info(f"Unique values in '{field_name}' for {feature_class}: {values}")
+    except Exception as e:
+        logging.error(f"Error checking field '{field_name}' in {feature_class}: {e}")
+        raise
+
+
+
  
 
 
@@ -315,14 +404,18 @@ if __name__ == "__main__":
         raster_to_polygon(reclassified_raster, polygons)
 
         lines = os.path.join(OUTPUT_GDB, "density_lines")
-        polygon_to_line(polygons, lines)
+        reprojected_lines = os.path.join(OUTPUT_GDB, "density_lines_reprojected")
+        lines = polygon_to_line(polygons, lines, reprojected_lines)
 
         # Perform spatial join with LION dataset
         lion_feature_class = os.path.join(LION_GDB, "LION")  # Replace with your LION feature class name
         joined_features = os.path.join(OUTPUT_GDB, "lion_joined_features")
         spatial_join(lion_feature_class, lines, joined_features)
 
-        # Log the record count
+        gridcode_values = {row[0] for row in arcpy.da.SearchCursor(joined_features, ["gridcode_1"])}
+        logging.info(f"Gridcode_1 values in joined features: {sorted(gridcode_values)}")
+
+        ''' # Log the record count
         count = int(arcpy.management.GetCount(joined_features)[0])
         logging.info(f"Spatial join completed with {count} features.")
         if count == 0:
@@ -331,11 +424,38 @@ if __name__ == "__main__":
         # Verify the data in joined_features
         if int(arcpy.management.GetCount(joined_features)[0]) == 0:
             logging.error("No features found in the joined_features dataset. GeoJSON export aborted.")
-            raise ValueError("No features available in joined_features.")
+            raise ValueError("No features available in joined_features.")'''
+        
+        # Perform the second spatial join
+        final_output_fc = os.path.join(OUTPUT_GDB, "final_joined_features")
+        second_spatial_join(joined_features, lines, final_output_fc)
+
+        '''# First spatial join with explicit field mapping
+        configure_field_mapping(lion_feature_class, lines, joined_features)
+        check_gridcode_values(joined_features, "gridcode")
+
+        # Second spatial join
+        configure_field_mapping(joined_features, lines, final_output_fc)
+        check_gridcode_values(final_output_fc, "gridcode")'''
+        
+
+        '''     # Verify the data in joined_features
+        gridcode_values = {row[0] for row in arcpy.da.SearchCursor(joined_features, ["gridcode"])}
+        logging.info(f"Gridcode values in joined features: {sorted(gridcode_values)}")'''
+
+        # Verify the data in joined_features
+        gridcode_values = {row[0] for row in arcpy.da.SearchCursor(final_output_fc, ["gridcode"])}
+        logging.info(f"Gridcode values in final features: {sorted(gridcode_values)}")
+
+        gridcode_1values = {row[0] for row in arcpy.da.SearchCursor(final_output_fc, ["gridcode_1"])}
+        logging.info(f"Gridcode_1 values in final features: {sorted(gridcode_1values)}")
+
+        gridcode_12values = {row[0] for row in arcpy.da.SearchCursor(final_output_fc, ["gridcode_12"])}
+        logging.info(f"Gridcode_12 values in final features: {sorted(gridcode_12values)}")
 
 
         # Export to GeoJSON
-        temp_geojson = f"C:\\Users\\cisuser\\Documents\\research\\temp_output.geojson"
+        '''temp_geojson = f"C:\\Users\\cisuser\\Documents\\research\\temp_output.geojson"
         export_to_geojson(joined_features, temp_geojson)
 
         with open(temp_geojson, "r") as geojson_file:
@@ -350,7 +470,7 @@ if __name__ == "__main__":
             "port": "5432"
         }
         table_name = upload_geojson_to_db(geojson_data, db_params)
-        logging.info(f"GeoJSON uploaded to table '{table_name}' successfully.")    
+        logging.info(f"GeoJSON uploaded to table '{table_name}' successfully.") '''   
 
         logging.info("Workflow completed successfully!")
     except Exception as e:
